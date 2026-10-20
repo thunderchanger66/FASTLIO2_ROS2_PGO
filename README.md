@@ -218,7 +218,8 @@ git clone https://github.com/ashduwihch/FASTLIO2_ROS2_PGO.git
 cd ~/fastlio2_pgo_ws
 source /opt/ros/humble/setup.bash
 source ~/livox_ws/install/setup.bash
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="/home/thunder/GRA_1/Sophus/build;/home/thunder/GRA_1/gtsam/build;/home/thunder/GRA_1/Open3D/install/lib/cmake/Open3D"
 ```
 
 编译完成后加载环境：
