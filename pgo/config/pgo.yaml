@@ -16,5 +16,5 @@ min_loop_detect_duration: 5.0
 # 保存目录不存在时会自动创建；仍可通过 /pgo/save_maps 服务随时手动保存。
 map_save:
   save_on_shutdown: true
-  save_path: /home/lin/fastlio2_pgo_ws/src/FASTLIO2_ROS2_PGO/pgo/maps
+  save_path: /home/thunder/GRA_1/fastlio2_pgo_ws/src/FASTLIO2_ROS2_PGO/pgo/maps
   save_patches: true

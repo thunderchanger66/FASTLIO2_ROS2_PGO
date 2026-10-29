@@ -37,7 +37,7 @@ struct NodeState
 {
     std::mutex message_mutex;
     std::queue<CloudWithPose> cloud_buffer;
-    double last_message_time;
+    double last_message_time{-1.0};
 };
 
 class PGONode : public rclcpp::Node
@@ -112,7 +112,7 @@ public:
     void syncCB(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_msg, const nav_msgs::msg::Odometry::ConstSharedPtr &odom_msg)
     {
 
-        std::lock_guard<std::mutex>(m_state.message_mutex);
+        std::lock_guard<std::mutex> lock(m_state.message_mutex);
         CloudWithPose cp;
         cp.pose.setTime(cloud_msg->header.stamp.sec, cloud_msg->header.stamp.nanosec);
         if (cp.pose.second < m_state.last_message_time)
@@ -278,12 +278,15 @@ public:
 
     void timerCB()
     {
-        if (m_state.cloud_buffer.size() == 0)
-            return;
-        CloudWithPose cp = m_state.cloud_buffer.front();
-        // 清理队列
+        CloudWithPose cp;
         {
-            std::lock_guard<std::mutex>(m_state.message_mutex);
+            std::lock_guard<std::mutex> lock(m_state.message_mutex);
+            if (m_state.cloud_buffer.empty())
+                return;
+            // Process the newest synchronized sample and discard backlog. PGO
+            // is a key-pose optimizer; replaying stale samples only increases
+            // latency for the live odometry chain.
+            cp = m_state.cloud_buffer.back();
             while (!m_state.cloud_buffer.empty())
             {
                 m_state.cloud_buffer.pop();
