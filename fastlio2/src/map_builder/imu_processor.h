@@ -11,6 +11,8 @@ public:
 
     void undistort(SyncPackage &package);
 
+    bool last_undistort_valid() const { return m_last_undistort_valid; }
+
 private:
     Config m_config;
     std::shared_ptr<IESKF> m_kf;
@@ -21,4 +23,5 @@ private:
     V3D m_last_gyro;
     M12D m_Q;
     IMUData m_last_imu;
+    bool m_last_undistort_valid{true};
 };

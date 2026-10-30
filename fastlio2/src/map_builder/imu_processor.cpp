@@ -1,4 +1,5 @@
 #include "imu_processor.h"
+#include <cmath>
 
 IMUProcessor::IMUProcessor(Config &config, std::shared_ptr<IESKF> kf) : m_config(config), m_kf(kf)
 {
@@ -15,7 +16,11 @@ IMUProcessor::IMUProcessor(Config &config, std::shared_ptr<IESKF> kf) : m_config
 
 bool IMUProcessor::initialize(SyncPackage &package)
 {
-    m_imu_cache.insert(m_imu_cache.end(), package.imus.begin(), package.imus.end());
+    for (const auto &imu : package.imus)
+    {
+        if (imu.acc.allFinite() && imu.gyro.allFinite() && std::isfinite(imu.time))
+            m_imu_cache.push_back(imu);
+    }
     if (m_imu_cache.size() < static_cast<size_t>(m_config.imu_init_num))
         return false;
     V3D acc_mean = V3D::Zero();
@@ -27,6 +32,13 @@ bool IMUProcessor::initialize(SyncPackage &package)
     }
     acc_mean /= static_cast<double>(m_imu_cache.size());
     gyro_mean /= static_cast<double>(m_imu_cache.size());
+    const double acc_norm = acc_mean.norm();
+    if (!acc_mean.allFinite() || !gyro_mean.allFinite() || !std::isfinite(acc_norm) ||
+        acc_norm < 1e-3 || acc_norm > 2.0 * State::gravity)
+    {
+        m_imu_cache.clear();
+        return false;
+    }
     m_kf->x().r_il = m_config.r_il;
     m_kf->x().t_il = m_config.t_il;
     m_kf->x().bg = gyro_mean;
@@ -37,6 +49,12 @@ bool IMUProcessor::initialize(SyncPackage &package)
     }
     else
         m_kf->x().initGravityDir(-acc_mean);
+    if (!m_kf->x().r_wi.allFinite() || !m_kf->x().g.allFinite())
+    {
+        m_imu_cache.clear();
+        m_kf->x() = State{};
+        return false;
+    }
     m_kf->P().setIdentity();
     m_kf->P().block<3, 3>(6, 6) = M3D::Identity() * 0.00001;
     m_kf->P().block<3, 3>(9, 9) = M3D::Identity() * 0.00001;
@@ -51,13 +69,40 @@ bool IMUProcessor::initialize(SyncPackage &package)
 void IMUProcessor::undistort(SyncPackage &package)
 {
 
+    m_last_undistort_valid = false;
+    if (!std::isfinite(package.cloud_start_time) || !std::isfinite(package.cloud_end_time) ||
+        package.cloud_end_time < package.cloud_start_time ||
+        package.cloud_end_time < m_last_propagate_end_time || package.imus.empty())
+        return;
+
     m_imu_cache.clear();
     m_imu_cache.push_back(m_last_imu);
     m_imu_cache.insert(m_imu_cache.end(), package.imus.begin(), package.imus.end());
 
-    // const double imu_time_begin = m_imu_cache.front().time;
-    const double imu_time_end = m_imu_cache.back().time;
+    for (size_t i = 1; i < m_imu_cache.size(); ++i)
+    {
+        if (!m_imu_cache[i].acc.allFinite() || !m_imu_cache[i].gyro.allFinite() ||
+            !std::isfinite(m_imu_cache[i].time) || m_imu_cache[i].time <= m_imu_cache[i - 1].time)
+            return;
+    }
 
+    const double imu_time_end = m_imu_cache.back().time;
+    double previous_time = m_last_propagate_end_time;
+    for (size_t i = 1; i < m_imu_cache.size(); ++i)
+    {
+        const double tail_time = m_imu_cache[i].time;
+        if (tail_time < m_last_propagate_end_time)
+            continue;
+        const double dt = tail_time - std::max(previous_time, m_imu_cache[i - 1].time);
+        if (!std::isfinite(dt) || dt <= 0.0 || dt > 1.0)
+            return;
+        previous_time = tail_time;
+    }
+    const double final_dt = package.cloud_end_time - imu_time_end;
+    if (!std::isfinite(final_dt) || final_dt < 0.0 || final_dt > 1.0)
+        return;
+
+    // const double imu_time_begin = m_imu_cache.front().time;
     const double cloud_time_begin = package.cloud_start_time;
     const double propagate_time_end = package.cloud_end_time;
 
@@ -129,4 +174,5 @@ void IMUProcessor::undistort(SyncPackage &package)
                 break;
         }
     }
+    m_last_undistort_valid = true;
 }

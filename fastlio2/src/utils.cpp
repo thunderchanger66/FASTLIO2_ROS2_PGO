@@ -1,11 +1,19 @@
 #include "utils.h"
+#include <algorithm>
+#include <cmath>
 pcl::PointCloud<pcl::PointXYZINormal>::Ptr Utils::livox2PCL(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg, int filter_num, double min_range, double max_range)
 {
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZINormal>);
-    int point_num = msg->point_num;
+    if (!msg || filter_num <= 0 || !std::isfinite(min_range) || !std::isfinite(max_range) ||
+        min_range < 0.0 || max_range <= min_range)
+        return cloud;
+    const size_t point_num = std::min(static_cast<size_t>(msg->point_num), msg->points.size());
     cloud->reserve(point_num / filter_num + 1);
-    for (int i = 0; i < point_num; i += filter_num)
+    for (size_t i = 0; i < point_num; i += static_cast<size_t>(filter_num))
     {
+        if (!std::isfinite(msg->points[i].x) || !std::isfinite(msg->points[i].y) ||
+            !std::isfinite(msg->points[i].z))
+            continue;
         if ((msg->points[i].line < 4) && ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
         {
 
@@ -19,7 +27,7 @@ pcl::PointCloud<pcl::PointXYZINormal>::Ptr Utils::livox2PCL(const livox_ros_driv
             p.y = y;
             p.z = z;
             p.intensity = msg->points[i].reflectivity;
-            p.curvature = msg->points[i].offset_time / 1000000.0f;
+            p.curvature = static_cast<float>(msg->points[i].offset_time) / 1000000.0f;
             cloud->push_back(p);
         }
     }

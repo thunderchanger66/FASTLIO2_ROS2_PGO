@@ -75,34 +75,65 @@ void IESKF::predict(const Input &inp, double dt, const M12D &Q)
     m_P = m_F * m_P * m_F.transpose() + m_G * Q * m_G.transpose();
 }
 
-void IESKF::update()
+bool IESKF::update()
 {
     State predict_x = m_x;
+    const M21D predict_P = m_P;
+    if (!predict_P.allFinite() || (predict_P - predict_P.transpose()).norm() > 1e-7)
+        return false;
+    Eigen::LDLT<M21D> prior_solver(predict_P);
+    if (prior_solver.info() != Eigen::Success || !prior_solver.isPositive())
+        return false;
+    const M21D prior_information = prior_solver.solve(M21D::Identity());
+    if (!prior_information.allFinite())
+        return false;
     SharedState shared_data;
     shared_data.iter_num = 0;
     shared_data.res = 1e10;
     V21D delta = V21D::Zero();
     M21D H = M21D::Identity();
     V21D b;
+    bool measurement_updated = false;
+    bool measurement_lost_during_iteration = false;
 
     for (size_t i = 0; i < m_max_iter; i++)
     {
         m_loss_func(m_x, shared_data);
-        if (!shared_data.valid)
+        if (!shared_data.valid) {
+            measurement_lost_during_iteration = true;
             break;
+        }
+        measurement_updated = true;
         H.setZero();
         b.setZero();
         delta = m_x - predict_x;
         M21D J = M21D::Identity();
         J.block<3, 3>(0, 0) = JrInv(delta.segment<3>(0));
         J.block<3, 3>(6, 6) = JrInv(delta.segment<3>(6));
-        H += J.transpose() * m_P.inverse() * J;
-        b += J.transpose() * m_P.inverse() * delta;
+        H += J.transpose() * prior_information * J;
+        b += J.transpose() * prior_information * delta;
 
         H.block<12, 12>(0, 0) += shared_data.H;
         b.block<12, 1>(0, 0) += shared_data.b;
 
-        delta = -H.inverse() * b;
+        H = 0.5 * (H + H.transpose()).eval();
+        if (!H.allFinite() || !b.allFinite())
+        {
+            m_x = predict_x;
+            return false;
+        }
+        Eigen::LDLT<M21D> information_solver(H);
+        if (information_solver.info() != Eigen::Success || !information_solver.isPositive())
+        {
+            m_x = predict_x;
+            return false;
+        }
+        delta = -information_solver.solve(b);
+        if (!delta.allFinite())
+        {
+            m_x = predict_x;
+            return false;
+        }
 
         m_x += delta;
         shared_data.iter_num += 1;
@@ -111,10 +142,31 @@ void IESKF::update()
             break;
     }
 
+    if (!measurement_updated || measurement_lost_during_iteration) {
+        m_x = predict_x;
+        return false;
+    }
+
     M21D L = M21D::Identity();
     // L.block<3, 3>(0, 0) = JrInv(delta.segment<3>(0));
     // L.block<3, 3>(6, 6) = JrInv(delta.segment<3>(6));
     L.block<3, 3>(0, 0) = Jr(delta.segment<3>(0));
     L.block<3, 3>(6, 6) = Jr(delta.segment<3>(6));
-    m_P = L * H.inverse() * L.transpose();
+    Eigen::LDLT<M21D> information_solver(H);
+    if (information_solver.info() != Eigen::Success || !information_solver.isPositive())
+    {
+        m_x = predict_x;
+        m_P = predict_P;
+        return false;
+    }
+    M21D updated_covariance = L * information_solver.solve(M21D::Identity()) * L.transpose();
+    updated_covariance = 0.5 * (updated_covariance + updated_covariance.transpose()).eval();
+    if (!updated_covariance.allFinite())
+    {
+        m_x = predict_x;
+        m_P = predict_P;
+        return false;
+    }
+    m_P = updated_covariance;
+    return true;
 }

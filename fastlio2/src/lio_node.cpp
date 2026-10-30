@@ -4,6 +4,7 @@
 #include <memory>
 #include <iostream>
 #include <chrono>
+#include <cmath>
 // #include <filesystem>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -106,30 +107,68 @@ public:
         m_builder_config.ieskf_max_iter = config["ieskf_max_iter"].as<int>();
         m_builder_config.gravity_align = config["gravity_align"].as<bool>();
         m_builder_config.esti_il = config["esti_il"].as<bool>();
+        m_builder_config.lidar_cov_inv = config["lidar_cov_inv"].as<double>();
         std::vector<double> t_il_vec = config["t_il"].as<std::vector<double>>();
         std::vector<double> r_il_vec = config["r_il"].as<std::vector<double>>();
+        if (t_il_vec.size() != 3 || r_il_vec.size() != 9 ||
+            m_builder_config.lidar_filter_num <= 0 ||
+            !std::isfinite(m_builder_config.lidar_min_range) || m_builder_config.lidar_min_range < 0.0 ||
+            !std::isfinite(m_builder_config.lidar_max_range) ||
+            m_builder_config.lidar_max_range <= m_builder_config.lidar_min_range ||
+            !std::isfinite(m_builder_config.scan_resolution) || m_builder_config.scan_resolution < 0.0 ||
+            !std::isfinite(m_builder_config.map_resolution) || m_builder_config.map_resolution <= 0.0 ||
+            !std::isfinite(m_builder_config.cube_len) || m_builder_config.cube_len <= 0.0 ||
+            !std::isfinite(m_builder_config.det_range) || m_builder_config.det_range <= 0.0 ||
+            !std::isfinite(m_builder_config.move_thresh) || m_builder_config.move_thresh <= 0.0 ||
+            m_builder_config.near_search_num < 3 || m_builder_config.ieskf_max_iter <= 0 ||
+            m_builder_config.imu_init_num <= 0 ||
+            !std::isfinite(m_builder_config.na) || m_builder_config.na < 0.0 ||
+            !std::isfinite(m_builder_config.ng) || m_builder_config.ng < 0.0 ||
+            !std::isfinite(m_builder_config.nba) || m_builder_config.nba < 0.0 ||
+            !std::isfinite(m_builder_config.nbg) || m_builder_config.nbg < 0.0 ||
+            !std::isfinite(m_builder_config.lidar_cov_inv) || m_builder_config.lidar_cov_inv <= 0.0)
+        {
+            throw std::runtime_error("FAST-LIO configuration contains invalid sizes or ranges");
+        }
         m_builder_config.t_il << t_il_vec[0], t_il_vec[1], t_il_vec[2];
         m_builder_config.r_il << r_il_vec[0], r_il_vec[1], r_il_vec[2], r_il_vec[3], r_il_vec[4], r_il_vec[5], r_il_vec[6], r_il_vec[7], r_il_vec[8];
-        m_builder_config.lidar_cov_inv = config["lidar_cov_inv"].as<double>();
+        if (!m_builder_config.t_il.allFinite() || !m_builder_config.r_il.allFinite() ||
+            (m_builder_config.r_il * m_builder_config.r_il.transpose() - M3D::Identity()).norm() > 1e-4 ||
+            std::abs(m_builder_config.r_il.determinant() - 1.0) > 1e-4)
+        {
+            throw std::runtime_error("FAST-LIO extrinsic calibration is not finite and rotational");
+        }
     }
 
     void imuCB(const sensor_msgs::msg::Imu::SharedPtr msg)
     {
         std::lock_guard<std::mutex> lock(m_state_data.imu_mutex);
         double timestamp = Utils::getSec(msg->header);
-        if (timestamp < m_state_data.last_imu_time)
+        const V3D acc(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
+        const V3D gyro(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
+        if (!std::isfinite(timestamp) || timestamp <= 0.0 || !acc.allFinite() || !gyro.allFinite())
         {
-            RCLCPP_WARN(this->get_logger(), "IMU Message is out of order");
-            std::deque<IMUData>().swap(m_state_data.imu_buffer);
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Dropping invalid IMU sample");
+            return;
+        }
+        if (timestamp <= m_state_data.last_imu_time)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Dropping out-of-order IMU sample");
+            return;
         }
         // sensor_msgs/Imu linear acceleration is already expressed in m/s^2.
-        m_state_data.imu_buffer.emplace_back(V3D(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z),
-                                             V3D(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z),
-                                             timestamp);
+        m_state_data.imu_buffer.emplace_back(acc, gyro, timestamp);
         m_state_data.last_imu_time = timestamp;
+        while (m_state_data.imu_buffer.size() > 20000)
+            m_state_data.imu_buffer.pop_front();
     }
     void lidarCB(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg)
     {
+        if (m_builder_config.lidar_filter_num <= 0)
+        {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Invalid lidar_filter_num; dropping scan");
+            return;
+        }
         CloudType::Ptr cloud = Utils::livox2PCL(msg, m_builder_config.lidar_filter_num, m_builder_config.lidar_min_range, m_builder_config.lidar_max_range);
         // Gazebo may publish an empty scan while the simulated lidar is starting.
         // PCL's transformPointCloud cannot handle a non-organized cloud whose
@@ -138,13 +177,29 @@ public:
             return;
         std::lock_guard<std::mutex> lock(m_state_data.lidar_mutex);
         double timestamp = Utils::getSec(msg->header);
-        if (timestamp < m_state_data.last_lidar_time)
+        if (!std::isfinite(timestamp) || timestamp <= 0.0)
         {
-            RCLCPP_WARN(this->get_logger(), "Lidar Message is out of order");
-            std::deque<std::pair<double, pcl::PointCloud<pcl::PointXYZINormal>::Ptr>>().swap(m_state_data.lidar_buffer);
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Dropping lidar scan with invalid timestamp");
+            return;
+        }
+        if (timestamp <= m_state_data.last_lidar_time)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Dropping out-of-order lidar scan");
+            return;
+        }
+        for (const auto &point : cloud->points)
+        {
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) ||
+                !std::isfinite(point.curvature) || point.curvature < 0.0f)
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Dropping lidar scan with invalid point data");
+                return;
+            }
         }
         m_state_data.lidar_buffer.emplace_back(timestamp, cloud);
         m_state_data.last_lidar_time = timestamp;
+        while (m_state_data.lidar_buffer.size() > 100)
+            m_state_data.lidar_buffer.pop_front();
     }
 
     bool syncPackage()
@@ -158,10 +213,27 @@ public:
                       { return p1.curvature < p2.curvature; });
             m_package.cloud_start_time = m_state_data.lidar_buffer.front().first;
             m_package.cloud_end_time = m_package.cloud_start_time + m_package.cloud->points.back().curvature / 1000.0;
+            if (!std::isfinite(m_package.cloud_end_time) ||
+                m_package.cloud_end_time < m_package.cloud_start_time ||
+                m_package.cloud_end_time - m_package.cloud_start_time > 1.0)
+            {
+                m_state_data.lidar_buffer.pop_front();
+                m_state_data.lidar_pushed = false;
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Dropping lidar scan with invalid scan duration");
+                return false;
+            }
             m_state_data.lidar_pushed = true;
         }
         if (m_state_data.last_imu_time < m_package.cloud_end_time)
             return false;
+
+        if (m_state_data.imu_buffer.empty() || m_state_data.imu_buffer.front().time >= m_package.cloud_end_time)
+        {
+            m_state_data.lidar_buffer.pop_front();
+            m_state_data.lidar_pushed = false;
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Dropping lidar scan without preceding IMU coverage");
+            return false;
+        }
 
         Vec<IMUData>().swap(m_package.imus);
         while (!m_state_data.imu_buffer.empty() && m_state_data.imu_buffer.front().time < m_package.cloud_end_time)
@@ -251,7 +323,7 @@ public:
         if (!syncPackage())
             return;
         auto t1 = std::chrono::high_resolution_clock::now();
-        m_builder->process(m_package);
+        const bool lidar_update_valid = m_builder->process(m_package);
         auto t2 = std::chrono::high_resolution_clock::now();
 
         if (m_node_config.print_time_cost)
@@ -262,6 +334,13 @@ public:
 
         if (m_builder->status() != BuilderStatus::MAPPING)
             return;
+
+        if (!lidar_update_valid)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                 "FAST-LIO scan has no valid map constraints; suppressing odometry output");
+            return;
+        }
 
         broadCastTF(m_tf_broadcaster, m_node_config.world_frame, m_node_config.body_frame, m_package.cloud_end_time);
 

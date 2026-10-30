@@ -150,7 +150,7 @@ void LidarProcessor::initCloudMap(PointVec &point_vec)
     m_ikdtree->Build(point_vec);
 }
 
-void LidarProcessor::process(SyncPackage &package)
+bool LidarProcessor::process(SyncPackage &package)
 {
     // m_kf->setLossFunction([&](State &s, SharedState &d)
     //                       { updateLossFunc(s, d); });
@@ -167,9 +167,36 @@ void LidarProcessor::process(SyncPackage &package)
     {
         pcl::copyPointCloud(*package.cloud, *m_cloud_down_lidar);
     }
+    const size_t cloud_size = m_cloud_down_lidar->size();
+    m_cloud_down_world->resize(cloud_size);
+    m_norm_vec->resize(cloud_size);
+    m_effect_cloud_lidar->resize(cloud_size);
+    m_effect_norm_vec->resize(cloud_size);
+    m_nearest_points.resize(cloud_size);
+    m_point_selected_flag.resize(cloud_size, false);
+    const State predicted_state = m_kf->x();
+    const M21D predicted_covariance = m_kf->P();
+    const bool measurement_updated = m_kf->update();
+    if (!measurement_updated)
+        return false;
+    const State &updated_state = m_kf->x();
+    const double rotation_step =
+        Sophus::SO3d(predicted_state.r_wi.transpose() * updated_state.r_wi).log().norm();
+    const double position_step = (updated_state.t_wi - predicted_state.t_wi).norm();
+    const double velocity_step = (updated_state.v - predicted_state.v).norm();
+    if (!updated_state.t_wi.allFinite() || !updated_state.v.allFinite() ||
+        !updated_state.r_wi.allFinite() || !m_kf->P().allFinite() || rotation_step > 0.5 ||
+        position_step > 1.0 || velocity_step > 5.0)
+    {
+        m_kf->x() = predicted_state;
+        m_kf->P() = predicted_covariance;
+        std::cerr << "FAST-LIO rejected an implausible scan update" << std::endl;
+        return false;
+    }
+    // Commit map-window movement only after the scan update has passed validation.
     trimCloudMap();
-    m_kf->update();
     incrCloudMap();
+    return true;
 }
 
 void LidarProcessor::updateLossFunc(State &state, SharedState &share_data)
