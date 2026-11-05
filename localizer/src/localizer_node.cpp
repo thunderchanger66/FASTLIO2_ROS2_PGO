@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 #include <Eigen/Core>
@@ -58,6 +59,15 @@ geometry_msgs::msg::Pose matrixToPose(const Eigen::Matrix4d &t)
     pose.orientation.z = q.z();
     pose.orientation.w = q.w();
     return pose;
+}
+
+bool finitePose(const geometry_msgs::msg::Pose &pose)
+{
+    const Eigen::Vector3d position(pose.position.x, pose.position.y, pose.position.z);
+    const Eigen::Quaterniond orientation(
+        pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+    return position.allFinite() && orientation.coeffs().allFinite() &&
+           orientation.norm() > 1e-9;
 }
 
 std::shared_ptr<O3dCloud> pclToOpen3d(const PclCloud &cloud)
@@ -151,11 +161,11 @@ public:
         relocalize_service_ = create_service<interface::srv::Relocalize>(
             "relocalize", std::bind(&LocalizerNode::relocalizeCallback, this,
                                      std::placeholders::_1, std::placeholders::_2),
-            rmw_qos_profile_services_default, localization_group_);
+            rclcpp::ServicesQoS(), localization_group_);
         check_service_ = create_service<interface::srv::IsValid>(
             "relocalize_check", std::bind(&LocalizerNode::checkCallback, this,
                                            std::placeholders::_1, std::placeholders::_2),
-            rmw_qos_profile_services_default, sensor_group_);
+            rclcpp::ServicesQoS(), sensor_group_);
 
         if (!loadMap(config_.map_path))
             RCLCPP_ERROR(get_logger(), "Prior map unavailable; localization is disabled");
@@ -199,6 +209,23 @@ private:
         config_.submap_publish_stride = i("submap_publish_stride", config_.submap_publish_stride);
         config_.override_initial_z = b("override_initial_z", config_.override_initial_z);
         config_.initial_z = d("initial_z", config_.initial_z);
+
+        if (config_.cloud_topic.empty() || config_.odom_topic.empty() ||
+            config_.map_frame.empty() || config_.odom_frame.empty() ||
+            config_.body_frame.empty() || config_.map_path.empty() ||
+            !std::isfinite(config_.map_voxel_size) || config_.map_voxel_size <= 0.0 ||
+            !std::isfinite(config_.scan_voxel_size) || config_.scan_voxel_size <= 0.0 ||
+            !std::isfinite(config_.localization_frequency) || config_.localization_frequency <= 0.0 ||
+            !std::isfinite(config_.publish_frequency) || config_.publish_frequency <= 0.0 ||
+            !std::isfinite(config_.localization_threshold) ||
+            config_.localization_threshold < 0.0 || config_.localization_threshold > 1.0 ||
+            !std::isfinite(config_.fov) || config_.fov <= 0.0 || config_.fov > 2.0 * M_PI ||
+            !std::isfinite(config_.fov_far) || config_.fov_far <= 0.0 ||
+            config_.max_iteration <= 0 || config_.submap_publish_stride <= 0 ||
+            !std::isfinite(config_.initial_z))
+        {
+            throw std::runtime_error("localizer configuration contains invalid values");
+        }
     }
 
     bool loadMap(const std::string &path)
@@ -227,6 +254,13 @@ private:
 
     void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     {
+        if (!msg->header.frame_id.empty() && msg->header.frame_id != config_.odom_frame)
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "Rejecting cloud frame [%s]; expected [%s]",
+                                 msg->header.frame_id.c_str(), config_.odom_frame.c_str());
+            return;
+        }
         PclCloud pcl_cloud;
         pcl::fromROSMsg(*msg, pcl_cloud);
         auto scan = pclToOpen3d(pcl_cloud);
@@ -243,6 +277,12 @@ private:
 
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
+        if (msg->header.frame_id != config_.odom_frame || !finitePose(msg->pose.pose))
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "Rejecting invalid odometry pose or frame");
+            return;
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         current_odom_ = msg;
     }
@@ -253,6 +293,11 @@ private:
         {
             RCLCPP_WARN(get_logger(), "Initial pose frame [%s] is not [%s]",
                         msg->header.frame_id.c_str(), config_.map_frame.c_str());
+            return;
+        }
+        if (!finitePose(msg->pose.pose))
+        {
+            RCLCPP_WARN(get_logger(), "Rejecting non-finite initial pose");
             return;
         }
         Eigen::Matrix4d initial = poseToMatrix(msg->pose.pose);
@@ -268,6 +313,13 @@ private:
     void relocalizeCallback(const std::shared_ptr<interface::srv::Relocalize::Request> req,
                             std::shared_ptr<interface::srv::Relocalize::Response> res)
     {
+        if (!std::isfinite(req->x) || !std::isfinite(req->y) || !std::isfinite(req->z) ||
+            !std::isfinite(req->roll) || !std::isfinite(req->pitch) || !std::isfinite(req->yaw))
+        {
+            res->success = false;
+            res->message = "initial pose contains non-finite values";
+            return;
+        }
         if (!req->pcd_path.empty() && req->pcd_path != config_.map_path && !loadMap(req->pcd_path))
         {
             res->success = false; res->message = "load map failed"; return;
@@ -302,6 +354,11 @@ private:
 
     bool runLocalization(const Eigen::Matrix4d &estimate, bool initialization)
     {
+        if (!estimate.allFinite())
+        {
+            RCLCPP_WARN(get_logger(), "Rejecting non-finite localization estimate");
+            return false;
+        }
         std::shared_ptr<O3dCloud> scan, map;
         nav_msgs::msg::Odometry::SharedPtr odom;
         {
@@ -315,33 +372,42 @@ private:
             odom = std::make_shared<nav_msgs::msg::Odometry>(*current_odom_);
         }
 
-        RCLCPP_INFO(get_logger(), "Global localization by scan-to-map matching...");
-        const auto start = std::chrono::steady_clock::now();
-        auto submap = cropMap(*map, estimate, *odom);
-        publishCloud(submap_pub_, *submap, config_.map_frame, rclcpp::Time(odom->header.stamp),
-                     config_.submap_publish_stride);
-        const bool valid = !scan->IsEmpty() && !submap->IsEmpty();
-        open3d::pipelines::registration::RegistrationResult coarse, fine;
-        if (valid)
-        {
-            coarse = registrationAtScale(*scan, *submap, estimate, 5.0);
-            fine = registrationAtScale(*scan, *submap, coarse.transformation_, 1.0);
-        }
-        const double seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - start).count();
-        const double fitness = valid ? fine.fitness_ : 0.0;
-        const double rmse = valid ? fine.inlier_rmse_ : 0.0;
+        bool success = false;
+        double fitness = 0.0;
+        double rmse = 0.0;
         Eigen::Matrix4d transform = estimate;
-        if (valid)
-            transform = fine.transformation_;
-        std::ostringstream matrix;
-        matrix << std::fixed << std::setprecision(4) << transform;
-        RCLCPP_INFO(get_logger(), "Time: %.3f s", seconds);
-        RCLCPP_INFO(get_logger(), "coarse fitness: %.6f", valid ? coarse.fitness_ : 0.0);
-        RCLCPP_INFO(get_logger(), "fitness score: %.6f, inlier RMSE: %.6f", fitness, rmse);
-        RCLCPP_INFO(get_logger(), "estimated map_to_odom:\n%s", matrix.str().c_str());
-
-        const bool success = valid && fitness > config_.localization_threshold;
+        try
+        {
+            RCLCPP_INFO(get_logger(), "Global localization by scan-to-map matching...");
+            const auto start = std::chrono::steady_clock::now();
+            auto submap = cropMap(*map, estimate, *odom);
+            publishCloud(submap_pub_, *submap, config_.map_frame,
+                         rclcpp::Time(odom->header.stamp), config_.submap_publish_stride);
+            if (!scan->IsEmpty() && !submap->IsEmpty())
+            {
+                const auto coarse = registrationAtScale(*scan, *submap, estimate, 5.0);
+                const auto fine = registrationAtScale(
+                    *scan, *submap, coarse.transformation_, 1.0);
+                fitness = fine.fitness_;
+                rmse = fine.inlier_rmse_;
+                transform = fine.transformation_;
+                success = std::isfinite(fitness) && std::isfinite(rmse) &&
+                          transform.allFinite() &&
+                          fitness > config_.localization_threshold;
+                RCLCPP_INFO(get_logger(), "coarse fitness: %.6f", coarse.fitness_);
+            }
+            const double seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+            RCLCPP_INFO(get_logger(), "Time: %.3f s", seconds);
+            RCLCPP_INFO(get_logger(), "fitness score: %.6f, inlier RMSE: %.6f", fitness, rmse);
+            std::ostringstream matrix;
+            matrix << std::fixed << std::setprecision(4) << transform;
+            RCLCPP_INFO(get_logger(), "estimated map_to_odom:\n%s", matrix.str().c_str());
+        }
+        catch (const std::exception &error)
+        {
+            RCLCPP_ERROR(get_logger(), "Scan-to-map localization failed: %s", error.what());
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (success) { map_to_odom_ = transform; initialized_ = true; }
@@ -368,9 +434,9 @@ private:
         {
             const Eigen::Vector3d body = (body_from_map * Eigen::Vector4d(p.x(), p.y(), p.z(), 1.0)).head<3>();
             const double angle = std::abs(std::atan2(body.y(), body.x()));
-            const bool inside = config_.fov > M_PI
-                ? body.x() < config_.fov_far && angle < config_.fov / 2.0
-                : body.x() > 0.0 && body.x() < config_.fov_far && angle < config_.fov / 2.0;
+            const bool inside_range = body.norm() < config_.fov_far;
+            const bool inside_fov = config_.fov > M_PI || body.x() > 0.0;
+            const bool inside = inside_range && inside_fov && angle < config_.fov / 2.0;
             if (inside) result->points_.push_back(p);
         }
         return result;
@@ -381,6 +447,8 @@ private:
     {
         const auto scan_down = scan.VoxelDownSample(config_.scan_voxel_size * scale);
         const auto map_down = map.VoxelDownSample(config_.map_voxel_size * scale);
+        if (!scan_down || !map_down || scan_down->IsEmpty() || map_down->IsEmpty())
+            throw std::runtime_error("scan or cropped map is empty after voxel filtering");
         const open3d::pipelines::registration::TransformationEstimationPointToPoint estimation(false);
         const open3d::pipelines::registration::ICPConvergenceCriteria criteria(1e-6, 1e-6, config_.max_iteration);
         return open3d::pipelines::registration::RegistrationICP(

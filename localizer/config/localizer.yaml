@@ -6,7 +6,8 @@ odom_topic: /fastlio2/lio_odom
 map_frame: map
 odom_frame: lidar
 body_frame: body
-map_path: /home/lin/fastlio2_pgo_ws/src/FASTLIO2_ROS2_PGO/pgo/maps/map.pcd
+# localizer_launch.py resolves the bundled map from the installed pgo package.
+map_path: map.pcd
 
 # 保留原版 FAST_LIO_LOCALIZATION 的 Open3D ICP 参数。
 map_voxel_size: 0.4

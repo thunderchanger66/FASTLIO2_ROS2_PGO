@@ -70,7 +70,8 @@ void IMUProcessor::undistort(SyncPackage &package)
 {
 
     m_last_undistort_valid = false;
-    if (!std::isfinite(package.cloud_start_time) || !std::isfinite(package.cloud_end_time) ||
+    if (!package.cloud || package.cloud->empty() ||
+        !std::isfinite(package.cloud_start_time) || !std::isfinite(package.cloud_end_time) ||
         package.cloud_end_time < package.cloud_start_time ||
         package.cloud_end_time < m_last_propagate_end_time || package.imus.empty())
         return;

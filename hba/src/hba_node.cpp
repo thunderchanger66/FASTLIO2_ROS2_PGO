@@ -5,6 +5,8 @@
 #include "hba/hba.h"
 #include <pcl/filters/voxel_grid.h>
 #include <filesystem>
+#include <fstream>
+#include <cmath>
 #include <pcl/io/pcd_io.h>
 #include <chrono>
 #include <cmath>
@@ -16,19 +18,22 @@
 #include "interface/srv/save_poses.hpp"
 
 using namespace std::chrono_literals;
-void fromStr(const std::string &str, std::string &file_name, Pose &pose)
+bool parsePoseLine(const std::string &str, std::string &file_name, Pose &pose)
 {
-    std::stringstream ss(str);
-    std::vector<std::string> tokens;
-    std::string token;
-    while (std::getline(ss, token, ' '))
-    {
-        tokens.push_back(token);
-    }
-    assert(tokens.size() == 8);
-    file_name = tokens[0];
-    pose.t = Eigen::Vector3d(std::stod(tokens[1]), std::stod(tokens[2]), std::stod(tokens[3]));
-    pose.r = Eigen::Quaterniond(std::stod(tokens[4]), std::stod(tokens[5]), std::stod(tokens[6]), std::stod(tokens[7])).normalized().toRotationMatrix();
+    std::istringstream stream(str);
+    double tx, ty, tz, qw, qx, qy, qz;
+    std::string extra;
+    if (!(stream >> file_name >> tx >> ty >> tz >> qw >> qx >> qy >> qz) || stream >> extra)
+        return false;
+    const std::filesystem::path patch_name(file_name);
+    const Eigen::Quaterniond orientation(qw, qx, qy, qz);
+    if (file_name.empty() || patch_name.filename() != patch_name ||
+        !std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz) ||
+        !orientation.coeffs().allFinite() || orientation.norm() < 1e-9)
+        return false;
+    pose.t = Eigen::Vector3d(tx, ty, tz);
+    pose.r = orientation.normalized().toRotationMatrix();
+    return true;
 }
 
 struct NodeConfig
@@ -123,30 +128,64 @@ public:
         }
 
         std::ifstream ifs(txt_file);
-        // A new request represents a new optimization job. Clear the previous
-        // scans so calling the service twice does not append duplicate patches.
-        m_hba = std::make_shared<HBA>(m_hba_config);
+        if (!ifs.is_open())
+        {
+            response->success = false;
+            response->message = "failed to open " + txt_file.string();
+            return;
+        }
+
+        // Load into temporary state so malformed input cannot replace a valid
+        // optimization session or leave it partially populated.
+        auto loaded_hba = std::make_shared<HBA>(m_hba_config);
         std::string line;
         std::string file_name;
         Pose pose;
         pcl::PCDReader reader;
+        std::size_t line_number = 0;
         while (std::getline(ifs, line))
         {
-
-            fromStr(line, file_name, pose);
-            std::filesystem::path pcd_file = p_dir / "patches" / file_name;
-            if (!std::filesystem::exists(pcd_file))
-            {
-                std::cerr << "pcd file not found" << std::endl;
+            ++line_number;
+            if (line.find_first_not_of(" \t\r\n") == std::string::npos)
                 continue;
+            if (!parsePoseLine(line, file_name, pose))
+            {
+                response->success = false;
+                response->message = "invalid pose record at line " + std::to_string(line_number);
+                return;
+            }
+            std::filesystem::path pcd_file = p_dir / "patches" / file_name;
+            if (!std::filesystem::is_regular_file(pcd_file))
+            {
+                response->success = false;
+                response->message = "patch file not found: " + pcd_file.string();
+                return;
             }
             pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>);
-            reader.read(pcd_file, *cloud);
+            if (reader.read(pcd_file.string(), *cloud) < 0 || cloud->empty())
+            {
+                response->success = false;
+                response->message = "failed to read non-empty patch: " + pcd_file.string();
+                return;
+            }
             m_voxel_grid.setInputCloud(cloud);
             m_voxel_grid.filter(*cloud);
-            m_hba->insert(cloud, pose);
+            if (cloud->empty())
+            {
+                response->success = false;
+                response->message = "patch is empty after filtering: " + pcd_file.string();
+                return;
+            }
+            loaded_hba->insert(cloud, pose);
         }
-        RCLCPP_INFO(this->get_logger(), "LOAD POSE %lu;", m_hba->poses().size());
+        if (loaded_hba->poses().empty())
+        {
+            response->success = false;
+            response->message = "poses file contains no valid records";
+            return;
+        }
+        m_hba = std::move(loaded_hba);
+        RCLCPP_INFO(this->get_logger(), "LOAD POSE %zu;", m_hba->poses().size());
         m_initial_poses = m_hba->poses();
         m_maps_path = p_dir;
         response->success = true;
