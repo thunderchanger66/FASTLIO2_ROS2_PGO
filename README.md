@@ -44,6 +44,10 @@ FAST-LIO2 的 Sophus 链接兼容和 RViz 显示优化，可直接配合
    ros2 launch fastlio2 lio_launch.py
    ```
 
+   MID-360 Gazebo 仿真必须使用 Gazebo 发布的 `/clock`；此 launch 默认启用
+   `use_sim_time`。连接真实雷达且没有 `/clock` 时，显式传入
+   `use_sim_time:=false`。
+
    或直接启动 FAST-LIO2、PGO 回环和 RViz：
 
    ```bash

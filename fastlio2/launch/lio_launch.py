@@ -9,7 +9,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     share = FindPackageShare('fastlio2')
     return LaunchDescription([
-        DeclareLaunchArgument('use_sim_time', default_value='false'),
+        DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('rviz', default_value='true'),
         DeclareLaunchArgument('config_path', default_value=PathJoinSubstitution(
             [share, 'config', 'lio.yaml'])),
